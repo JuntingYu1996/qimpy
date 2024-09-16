@@ -139,7 +139,7 @@ class Light(TreeNode):
                 "Parameter gauge should only be velocity or length"
             )
 
-        # reshape omega here for convinient broadcasting
+        # reshape omega here for convenient broadcasting
         omega = (omega * torch.ones([1, 1]).to(rc.device))[..., None, None, None]
         self.t0[patch_id] = t0
         self.sigma[patch_id] = sigma
@@ -148,14 +148,14 @@ class Light(TreeNode):
             self.omega[patch_id] = omega
         else:  #: lindblad version
             prefac = torch.sqrt(torch.sqrt(torch.pi / (8 * smearing**2)))
-            exp_factor = -1.0 / (smearing**2)
+            exp_factor = -1.0 / (4*smearing**2)
             Nk, Nb = ab_initio.E.shape
             dE = (ab_initio.E[..., None] - ab_initio.E[:, None, :])[None, None]
             plus = prefac * amp_mat * torch.exp(exp_factor * ((dE + omega) ** 2))
             minus = prefac * amp_mat * torch.exp(exp_factor * ((dE - omega) ** 2))
             plus_deg = plus.swapaxes(-2, -1).conj()
             minus_deg = minus.swapaxes(-2, -1).conj()
-            self.eye = torch.tile(torch.eye(Nb), (1, Nk, 1, 1)).to(rc.device)
+            self.eye = torch.tile(torch.eye(Nb), (1, 1, Nk, 1, 1)).to(rc.device)
             self.plus[patch_id] = plus
             self.plus_deg[patch_id] = plus_deg
             self.minus[patch_id] = minus
