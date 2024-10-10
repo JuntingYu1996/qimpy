@@ -17,6 +17,7 @@ class Light(TreeNode):
     A0: torch.Tensor  #: Vector potential amplitude
     E0: torch.Tensor  #: Electric field amplitude
     smearing: float  #: Width of Gaussian
+    symmetric: bool  #: Whether symmetric lindblad is used
     omega: dict[int, torch.Tensor]  #: light frequency
     t0: dict[int, torch.Tensor]  #: center of Gaussian pulse, if sigma is non-zero
     sigma: dict[int, torch.Tensor]  #: width of Gaussian pulse in time, if non-zero
@@ -40,6 +41,7 @@ class Light(TreeNode):
         t0: float = 0.0,
         sigma: float = 0.0,
         smearing: float = 0.001,
+        symmetric: bool = True,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         """
@@ -71,6 +73,7 @@ class Light(TreeNode):
         self.coherent = coherent
         self.ab_initio = ab_initio
         self.gauge = gauge
+        self.symmetric = symmetric
 
         # Get amplitude from A0 or E0:
         if (A0 is None) == (E0 is None):
@@ -96,11 +99,14 @@ class Light(TreeNode):
         if self.coherent:
             self.amp_mat = {}
             self.omega = {}
-        else:
+        elif self.symmetric:
             self.plus = {}
             self.plus_deg = {}
             self.minus = {}
             self.minus_deg = {}
+        else:
+            self.gdeg = {}
+            self.Gamma = {}
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext
@@ -113,6 +119,7 @@ class Light(TreeNode):
         attrs["smearing"] = self.constant_params["smearing"].item()
         attrs["coherent"] = self.coherent
         attrs["gauge"] = self.gauge
+        attrs["symmetric"] = self.symmetric
         return list(attrs.keys())
 
     def initialize_fields(self, params: dict[str, torch.Tensor], patch_id: int) -> None:
@@ -146,9 +153,9 @@ class Light(TreeNode):
         if self.coherent:
             self.amp_mat[patch_id] = amp_mat[None, None]
             self.omega[patch_id] = omega
-        else:  #: lindblad version
+        elif self.symmetric:  #: lindblad version
             prefac = torch.sqrt(torch.sqrt(torch.pi / (8 * smearing**2)))
-            exp_factor = -1.0 / (4*smearing**2)
+            exp_factor = -1.0 / (4 * smearing**2)
             Nk, Nb = ab_initio.E.shape
             dE = (ab_initio.E[..., None] - ab_initio.E[:, None, :])[None, None]
             plus = prefac * amp_mat * torch.exp(exp_factor * ((dE + omega) ** 2))
@@ -160,6 +167,16 @@ class Light(TreeNode):
             self.plus_deg[patch_id] = plus_deg
             self.minus[patch_id] = minus
             self.minus_deg[patch_id] = minus_deg
+        else:
+            self.gdeg[patch_id] = amp_mat.swapaxes(-1,-2).conj()
+            prefac = torch.sqrt(torch.pi / (8 * smearing**2))
+            dE = (ab_initio.E[..., None] - ab_initio.E[:, None, :])[None, None]
+            exp_factor = -1.0 / (2 * smearing**2)
+            delta_plus = torch.exp(exp_factor * ((dE + omega) ** 2))
+            delta_minus = torch.exp(exp_factor * ((dE - omega) ** 2))
+            self.Gamma[patch_id] = prefac * amp_mat * (delta_plus + delta_minus)
+            Nk, Nb = ab_initio.E.shape
+            self.eye = torch.tile(torch.eye(Nb), (1, 1, Nk, 1, 1)).to(rc.device)
 
     @stopwatch
     def rho_dot(self, rho: torch.Tensor, t: float, patch_id: int) -> torch.Tensor:
@@ -182,7 +199,7 @@ class Light(TreeNode):
             )  # Louiville, symmetrization
             interaction = prefac * self.amp_mat[patch_id]
             return (interaction - interaction.swapaxes(-2, -1).conj()) @ rho
-        else:
+        elif self.symmetric:
             prefac = 0.5 * prefac**2
             I_minus_rho = self.eye - rho
             plus = self.plus[patch_id]
@@ -193,6 +210,12 @@ class Light(TreeNode):
                 commutator(I_minus_rho @ plus @ rho, plus_deg)
                 + commutator(I_minus_rho @ minus @ rho, minus_deg)
             )
+        else:
+            prefac = 0.5 * prefac**2
+            I_minus_rho = self.eye - rho
+            gdeg = self.gdeg[patch_id]
+            Gamma = self.Gamma[patch_id]
+            return prefac * commutator(I_minus_rho @ Gamma @ rho, gdeg)
 
 
 def commutator(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:

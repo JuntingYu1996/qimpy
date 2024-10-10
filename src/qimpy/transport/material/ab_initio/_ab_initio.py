@@ -55,6 +55,7 @@ class AbInitio(Material):
     observables: torch.Tensor  #: Observable matrix elements in Schrodinger picture
     observable_names: list[str]  #: list of observable names to be output
     dynamics_terms: dict[str, DynamicsTerm]  #: all active drho/dt contributions
+    fix_occ: bool # fixing occupation, experimental
 
     def __init__(
         self,
@@ -70,6 +71,7 @@ class AbInitio(Material):
         lindblad: Optional[Union[Lindblad, dict]] = None,
         light: Optional[Union[Light, dict]] = None,
         pulseB: Optional[Union[PulseB, dict]] = None,
+        fix_occ: bool = False,
         process_grid: ProcessGrid,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ):
@@ -251,6 +253,7 @@ class AbInitio(Material):
                 raise InvalidInputException(f"{observable_name = } is not supported")
         self.observables = torch.stack(observables, dim=0)
         self.observable_names = list(observable_names)
+        self.fix_occ = fix_occ
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext
@@ -376,6 +379,9 @@ class AbInitio(Material):
         rho_dot_S = torch.zeros_like(rho_S)
         for dynamics_term in self.dynamics_terms.values():
             rho_dot_S += dynamics_term.rho_dot(rho_S, t, patch_id)
+        # fixing occupation to force steady state
+        if self.fix_occ:
+            rho_dot_S[..., range(self.n_bands), range(self.n_bands)] = 0.0 + 0.0j
 
         # Convert result back to interaction picture:
         watch = StopWatch("AbInitio.rho_dot_post")
