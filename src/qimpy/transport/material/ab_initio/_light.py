@@ -167,7 +167,7 @@ class Light(TreeNode):
             self.plus_deg[patch_id] = plus_deg
             self.minus[patch_id] = minus
             self.minus_deg[patch_id] = minus_deg
-        else:
+        else: # conventional Markov
             self.gdeg[patch_id] = amp_mat.swapaxes(-1,-2).conj()
             prefac = torch.sqrt(torch.pi / (8 * smearing**2))
             dE = (ab_initio.E[..., None] - ab_initio.E[:, None, :])[None, None]

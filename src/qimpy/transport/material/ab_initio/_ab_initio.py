@@ -17,7 +17,7 @@ from qimpy.io import (
 )
 from qimpy.mpi import ProcessGrid
 from .. import Material, fermi
-from . import PackedHermitian, RelaxationTime, Lindblad, Light, PulseB
+from . import PackedHermitian, RelaxationTime, Lindblad, Light, PulseB, Spontaneous
 
 
 class DynamicsTerm(Protocol):
@@ -71,6 +71,7 @@ class AbInitio(Material):
         lindblad: Optional[Union[Lindblad, dict]] = None,
         light: Optional[Union[Light, dict]] = None,
         pulseB: Optional[Union[PulseB, dict]] = None,
+        spontaneous: Optional[Union[PulseB, dict]] = None,
         fix_occ: bool = False,
         process_grid: ProcessGrid,
         checkpoint_in: CheckpointPath = CheckpointPath(),
@@ -204,6 +205,10 @@ class AbInitio(Material):
             if (pulseB is not None) or checkpoint_in.member("pulseB"):
                 self.add_child("pulseB", PulseB, pulseB, checkpoint_in, ab_initio=self)
                 self.dynamics_terms["pulseB"] = self.pulseB
+
+            if (spontaneous is not None) or checkpoint_in.member("spontaneous"):
+                self.add_child("spontaneous", Spontaneous, spontaneous, checkpoint_in, ab_initio=self)
+                self.dynamics_terms["spontaneous"] = self.spontaneous
 
         # Control output observables:
         if isinstance(observable_names, str):
