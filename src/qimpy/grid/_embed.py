@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import numpy as np
 
-from . import Grid, Coulomb, FieldR
+from . import Grid, FieldR
 from qimpy import rc
 from qimpy.symmetries import Symmetries
 from qimpy.lattice import Lattice
@@ -13,15 +13,12 @@ from qimpy.lattice._wigner_seitz import WignerSeitz
 class CoulombEmbedder:
     """Class for embedding a center for truncated Coulomb interactions"""
 
-    embed: bool  #: whether to embed a center to compute truncated Coulomb interactions
-    periodic: tuple[bool, ...]  #: Whether each direction is periodic
-    center: torch.Tensor  #: 'center' of the system in lattice coordinates
+    periodic: tuple[bool, bool, bool]  #: Periodicity of each lattice vector
     gridOrig: Grid  #: Original grid
     gridEmbed: Grid  #: Embedded grid
     bMap: torch.Tensor  #: Transformation matrix from original --> embedding grid
-    ion_width: float  #: Ion-charge gaussian width for embedding TODO: implement
 
-    def __init__(self, grid: Grid, coulomb: Coulomb) -> None:
+    def __init__(self, grid: Grid) -> None:
         """Initialize coulomb embedding.
 
         Parameters
@@ -34,35 +31,34 @@ class CoulombEmbedder:
 
         self.gridOrig = grid
         self.periodic = grid.lattice.periodic
-        self.center = grid.lattice.center
-        self.ion_width = coulomb.ion_width
 
         gridOrig = self.gridOrig
 
         # Initialize embedding grid
-        meshOrig = gridOrig.get_mesh("R", mine=True)
-        Sorig = torch.tensor(gridOrig.shape)
+        Sorig = torch.tensor(gridOrig.shape, device=rc.device)
         RbasisOrig = gridOrig.lattice.Rbasis
         # Extend cell in non-periodic directions
         dimScale = np.where(self.periodic, 1, 2)
-        latticeEmbed = Lattice(Rbasis=(RbasisOrig @ np.diag(dimScale)))
+        dimScale_t = torch.from_numpy(dimScale).to(rc.device)
+        latticeEmbed = Lattice(Rbasis=(RbasisOrig * dimScale_t))
         gridEmbed = Grid(
             lattice=latticeEmbed,
             symmetries=Symmetries(lattice=latticeEmbed),
             shape=tuple(dimScale * gridOrig.shape),
             comm=rc.comm,
         )
-        Sembed = torch.tensor(gridEmbed.shape)
+        self.gridEmbed = gridEmbed
+        Sembed = torch.tensor(gridEmbed.shape, device=rc.device)
         # Report embedding center in various coordinate systems:
-        latticeCenter = torch.tensor(self.center)
-        rCenter = RbasisOrig @ latticeCenter
+        lattice_center = grid.lattice.center
+        rCenter = RbasisOrig @ lattice_center
         ivCenter = torch.round(
-            latticeCenter @ (1.0 * torch.diag(torch.tensor(gridOrig.shape)))
-        ).to(int)
+            lattice_center * torch.tensor(gridOrig.shape, device=rc.device)
+        ).to(torch.int)
         print("Integer grid location selected as the embedding center:")
-        print("\tGrid: {:6} {:6} {:6}".format(*tuple(ivCenter)))
-        print("\tLattice: {:6.3f} {:6.3f} {:6.3f}".format(*tuple(latticeCenter)))
-        print("\tCartesian: {:6.3f} {:6.3f} {:6.3f}".format(*tuple(rCenter)))
+        print("\tGrid: {:6} {:6} {:6}".format(*ivCenter.tolist()))
+        print("\tLattice: {:6.3f} {:6.3f} {:6.3f}".format(*lattice_center.tolist()))
+        print("\tCartesian: {:6.3f} {:6.3f} {:6.3f}".format(*rCenter.tolist()))
         # Setup Wigner-Seitz cells of original and embed meshes
         wsOrig = WignerSeitz(gridOrig.lattice.Rbasis)
         wsEmbed = WignerSeitz(gridEmbed.lattice.Rbasis)
@@ -70,25 +66,24 @@ class CoulombEmbedder:
         ivEmbed = gridEmbed.get_mesh("R", mine=True).reshape(-1, 3)
         ivEmbed_wsOrig = wsEmbed.reduce_index(ivEmbed, Sembed)
         # Shift original mesh to be centered about the origin
-        shifts = torch.round(latticeCenter * torch.tensor(meshOrig.shape[0:3])).to(int)
-        ivEquivOrig = (ivEmbed_wsOrig + shifts) % Sorig[None, :]
+        shifts = torch.round(lattice_center * Sorig).to(torch.int)
+        ivEquivOrig = (ivEmbed_wsOrig + shifts) % Sorig
         # Setup mapping between original and embedding meshes
         iEmbed = ivEmbed[:, 2] + Sembed[2] * (ivEmbed[:, 1] + Sembed[1] * ivEmbed[:, 0])
         iEquivOrig = ivEquivOrig[:, 2] + Sorig[2] * (
             ivEquivOrig[:, 1] + Sorig[1] * ivEquivOrig[:, 0]
         )
         # Symmetrize points on boundary using weight function "smoothTheta" function
-        diagSembedInv = torch.diag(1 / torch.tensor(gridEmbed.shape))
-        xWS = (1.0 * ivEmbed_wsOrig @ diagSembedInv) @ gridEmbed.lattice.Rbasis.T
+        invSembed = 1 / torch.tensor(gridEmbed.shape, device=rc.device)
+        xWS = (invSembed * ivEmbed_wsOrig) @ gridEmbed.lattice.Rbasis.T
         weights = smoothTheta(wsOrig.ws_boundary_distance(xWS))
+        # --- normalize weights:
+        weight_sum = torch.zeros(Sorig.prod(), device=rc.device)
+        weight_sum.index_add_(0, iEquivOrig, weights)
+        weights *= 1.0 / weight_sum[iEquivOrig]
         self.bMap = torch.sparse_coo_tensor(
-            np.array([iEquivOrig, iEmbed]), weights, device=rc.device
+            torch.stack([iEquivOrig, iEmbed]), weights, device=rc.device
         )
-        colSums = torch.sparse.sum(self.bMap, dim=1).to_dense()
-        colNorms = torch.sparse.spdiags(
-            1.0 / colSums, offsets=torch.tensor([0]), shape=(Sorig.prod(), Sorig.prod())
-        )
-        self.bMap = torch.sparse.mm(colNorms, self.bMap)
 
     def embedExpand(self, fieldOrig: FieldR) -> FieldR:
         """Expand real-space field 'fieldOrig' within larger embedding cell."""
