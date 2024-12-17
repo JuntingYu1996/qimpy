@@ -17,7 +17,7 @@ from qimpy.io import (
 )
 from qimpy.mpi import ProcessGrid
 from .. import Material, fermi
-from . import PackedHermitian, RelaxationTime, Lindblad, Light, PulseB, Spontaneous
+from . import PackedHermitian, RelaxationTime, Lindblad, Light, PulseB, Spontaneous, Phonon
 
 
 class DynamicsTerm(Protocol):
@@ -71,7 +71,8 @@ class AbInitio(Material):
         lindblad: Optional[Union[Lindblad, dict]] = None,
         light: Optional[Union[Light, dict]] = None,
         pulseB: Optional[Union[PulseB, dict]] = None,
-        spontaneous: Optional[Union[PulseB, dict]] = None,
+        spontaneous: Optional[Union[Spontaneous, dict]] = None,
+        phonon: Optional[Union[Phonon, dict]] = None,
         fix_occ: bool = False,
         process_grid: ProcessGrid,
         checkpoint_in: CheckpointPath = CheckpointPath(),
@@ -209,6 +210,17 @@ class AbInitio(Material):
             if (spontaneous is not None) or checkpoint_in.member("spontaneous"):
                 self.add_child("spontaneous", Spontaneous, spontaneous, checkpoint_in, ab_initio=self)
                 self.dynamics_terms["spontaneous"] = self.spontaneous
+
+            if (phonon is not None) or checkpoint_in.member("phonon"):
+                self.add_child(
+                    "phonon",
+                    Phonon,
+                    phonon,
+                    checkpoint_in,
+                    ab_initio=self,
+                    data_file=data_file,
+                )
+                self.dynamics_terms["phonon"] = self.phonon
 
         # Control output observables:
         if isinstance(observable_names, str):

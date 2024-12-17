@@ -41,7 +41,8 @@ class Light(TreeNode):
         t0: float = 0.0,
         sigma: float = 0.0,
         smearing: float = 0.001,
-        symmetric: bool = True,
+        symmetric: bool = False,
+        matrix_form: bool = True,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         """
@@ -74,6 +75,7 @@ class Light(TreeNode):
         self.ab_initio = ab_initio
         self.gauge = gauge
         self.symmetric = symmetric
+        self.matrix_form = matrix_form
 
         # Get amplitude from A0 or E0:
         if (A0 is None) == (E0 is None):
@@ -105,8 +107,14 @@ class Light(TreeNode):
             self.minus = {}
             self.minus_deg = {}
         else:
-            self.gdeg = {}
-            self.Gamma = {}
+            if matrix_form:
+                self.gamma_plus = {}
+                self.gamma_minus = {}
+                self.Gamma_plus = {}
+                self.Gamma_minus = {}
+            else:
+                self.P = {}
+                self.Peye = {}
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext
@@ -162,21 +170,32 @@ class Light(TreeNode):
             minus = prefac * amp_mat * torch.exp(exp_factor * ((dE - omega) ** 2))
             plus_deg = plus.swapaxes(-2, -1).conj()
             minus_deg = minus.swapaxes(-2, -1).conj()
-            self.eye = torch.tile(torch.eye(Nb), (1, 1, Nk, 1, 1)).to(rc.device)
             self.plus[patch_id] = plus
             self.plus_deg[patch_id] = plus_deg
             self.minus[patch_id] = minus
             self.minus_deg[patch_id] = minus_deg
         else: # conventional Markov
-            self.gdeg[patch_id] = amp_mat.swapaxes(-1,-2).conj()
-            prefac = torch.sqrt(torch.pi / (8 * smearing**2))
+            prefac = torch.sqrt(torch.pi / (32 * smearing**2))
             dE = (ab_initio.E[..., None] - ab_initio.E[:, None, :])[None, None]
             exp_factor = -1.0 / (2 * smearing**2)
-            delta_plus = torch.exp(exp_factor * ((dE + omega) ** 2))
-            delta_minus = torch.exp(exp_factor * ((dE - omega) ** 2))
-            self.Gamma[patch_id] = prefac * amp_mat * (delta_plus + delta_minus)
-            Nk, Nb = ab_initio.E.shape
-            self.eye = torch.tile(torch.eye(Nb), (1, 1, Nk, 1, 1)).to(rc.device)
+            delta = torch.exp(exp_factor * ((dE - omega) ** 2))
+            if self.matrix_form:
+                gamma_plus = amp_mat
+                gamma_minus = amp_mat.swapaxes(-1,-2).conj()
+                Gamma_minus = prefac * amp_mat * delta
+                Gamma_plus = Gamma_minus.swapaxes(-1,-2).conj()
+                self.gamma_plus[patch_id] = gamma_plus
+                self.gamma_minus[patch_id] = gamma_minus
+                self.Gamma_plus[patch_id] = Gamma_plus
+                self.Gamma_minus[patch_id] = Gamma_minus
+            else:
+                P = prefac * (
+                    torch.einsum("...kac, kac, kbd -> ...kabcd", delta, amp_mat, amp_mat.conj())
+                    + torch.einsum("...kca, kca, kdb -> ...kabcd", delta, amp_mat.conj(), amp_mat)
+                )
+                Peye = torch.einsum("...kabcc -> ...kab", P)
+                self.P[patch_id] = P
+                self.Peye[patch_id] = Peye
 
     @stopwatch
     def rho_dot(self, rho: torch.Tensor, t: float, patch_id: int) -> torch.Tensor:
@@ -201,7 +220,7 @@ class Light(TreeNode):
             return (interaction - interaction.swapaxes(-2, -1).conj()) @ rho
         elif self.symmetric:
             prefac = 0.5 * prefac**2
-            I_minus_rho = self.eye - rho
+            I_minus_rho = self.ab_initio.eye_bands - rho
             plus = self.plus[patch_id]
             minus = self.minus[patch_id]
             plus_deg = self.plus_deg[patch_id]
@@ -211,11 +230,23 @@ class Light(TreeNode):
                 + commutator(I_minus_rho @ minus @ rho, minus_deg)
             )
         else:
-            prefac = 0.5 * prefac**2
-            I_minus_rho = self.eye - rho
-            gdeg = self.gdeg[patch_id]
-            Gamma = self.Gamma[patch_id]
-            return prefac * commutator(I_minus_rho @ Gamma @ rho, gdeg)
+            prefac = prefac**2
+            I_minus_rho = self.ab_initio.eye_bands - rho
+            if self.matrix_form: # Faster
+                gamma_plus = self.gamma_plus[patch_id]
+                gamma_minus = self.gamma_minus[patch_id]
+                Gamma_plus = self.Gamma_plus[patch_id]
+                Gamma_minus = self.Gamma_minus[patch_id]
+                return prefac * (
+                    commutator(I_minus_rho @ Gamma_plus @ rho, gamma_plus) + 
+                    commutator(I_minus_rho @ Gamma_minus @ rho, gamma_minus)
+                )
+            else:
+                P = self.P[patch_id]
+                Peye = self.Peye[patch_id]
+                Prho = torch.einsum("...abcd, ...cd -> ...ab", P, rho)
+                # return prefac * (I_minus_rho @ Prho - rho @ (Peye - Prho))
+                return prefac * (Prho - rho @ Peye)
 
 
 def commutator(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:

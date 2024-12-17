@@ -5,6 +5,7 @@ __all__ = [
     "Light",
     "PulseB",
     "Spontaneous",
+    "Phonon",
     "AbInitio",
 ]
 
@@ -14,4 +15,5 @@ from ._lindblad import Lindblad
 from ._light import Light
 from ._pulse_b import PulseB
 from ._spontaneous import Spontaneous
+from ._phonon import Phonon
 from ._ab_initio import AbInitio
