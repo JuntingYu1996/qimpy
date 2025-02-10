@@ -23,7 +23,7 @@ class Phonon(TreeNode):
     P: torch.Tensor  #: P and Pbar operators stacked together
     rho_dot0: torch.Tensor  #: rho_dot(rho0) for detailed balance correction
     smearing: float  #: Width of delta function
-    form: str  #: Conventional Markov or Lindblad
+    form: str  #: Fermi-golden, conventional Markov or Lindblad
     matrix_form: bool  #: Whether to use matrix form or P form
 
     constant_params: dict[str, torch.Tensor]  #: constant values of parameters
@@ -55,12 +55,11 @@ class Phonon(TreeNode):
         self.smearing = smearing
         self.form = form
         self.matrix_form = matrix_form
-        if not form in ["conventional", "lindblad"]:
-            raise InvalidInputException("form must be conventional or lindblad")
+        if not form in ["fermi-golden", "conventional", "lindblad"]:
+            raise InvalidInputException("form must be fermi-golden, conventional or lindblad")
         if not bool(data_file.attrs["ePhEnabled"]):
             raise InvalidInputException("No e-ph scattering available in data file")
 
-        log.info("Constructing P tensor")
         nk = ab_initio.k_division.n_tot
         ik_start = ab_initio.k_division.i_start
         ik_stop = ab_initio.k_division.i_stop
@@ -117,7 +116,45 @@ class Phonon(TreeNode):
         cp_omega_ph = data_file["omega_ph"]
         cp_g = data_file["G"] # original electron-phonon matrix
         cp_E = torch.from_numpy(np.array(data_file["E"])).to(rc.device)
-        if not matrix_form:
+        if form == "fermi-golden":
+            log.info("Using Fermi's Golden rule for phonon scattering.")
+            Tshape = (2, nk_mine * nk, n_bands, n_bands)
+            T = torch.zeros(Tshape, dtype=torch.double, device=rc.device)
+            for block_start, block_stop in zip(block_lims[:-1], block_lims[1:]):
+                # Read current slice of data:
+                cur = slice(block_start, block_stop)
+                ik, jk = torch.from_numpy(cp_ikpair[cur]).to(rc.device).T
+                omega_ph = torch.from_numpy(cp_omega_ph[cur]).to(rc.device)
+                g = torch.from_numpy(cp_g[cur]).to(rc.device)
+                if evecs is not None:
+                    g = torch.einsum("kba, kbc, kcd -> kad", evecs[ik].conj(), g, evecs[jk])
+                bose_occ = bose(omega_ph, ab_initio.T)[:, None, None]
+                wm = prefactor * bose_occ
+                wp = prefactor * (bose_occ + 1.0)
+                # Contributions to T(ik,jk):
+                if (sel := get_mine(ik)) is not None:
+                    i_pair = (ik[sel] - ik_start) * nk + jk[sel]
+                    dE = cp_E[ik[sel]][..., None] - cp_E[jk[sel]][..., None, :]
+                    gcur = g[sel]
+                    delta = torch.exp(exp_factor * (dE - omega_ph[sel, None, None])**2)
+                    Gsq = (gcur * gcur.conj()).real * delta
+                    T[0].index_add_(0, i_pair, wm[sel] * Gsq)
+                    T[1].index_add_(0, i_pair, wp[sel] * Gsq)
+                # Contributions to T(jk,ik):
+                if (sel := get_mine(jk)) is not None:
+                    i_pair = (jk[sel] - ik_start) * nk + ik[sel]
+                    dE = cp_E[ik[sel]][..., None] - cp_E[jk[sel]][..., None, :]
+                    gcur = g[sel]
+                    delta = torch.exp(exp_factor * (dE - omega_ph[sel, None, None])**2)
+                    Gsq = ((gcur * gcur.conj()).real * delta).swapaxes(-1, -2)
+                    T[0].index_add_(0, i_pair, wp[sel] * Gsq)
+                    T[1].index_add_(0, i_pair, wm[sel] * Gsq)
+
+            self.T = T.unflatten(1, (nk_mine, nk))
+            self.T2eye = torch.einsum("kKab -> ka", self.T[1])
+
+        elif not matrix_form:
+            log.info("Constructing P tensor")
             P_shape = (2, nk_mine * nk, n_bands_sq, n_bands_sq)
             nbytes = 16 * np.prod(P_shape)
             log.info(f"Memory for P matrix: {bytes2memory(nbytes)}.")
@@ -176,6 +213,7 @@ class Phonon(TreeNode):
             )[1]
 
         else: # matrix form is slower but may save memory, lindblad not implemented
+            log.info("Using matrix form for electron-phonon")
             g_mine, Gamma1, Gamma2, kpair_mine = [], [], [], []
             for block_start, block_stop in zip(block_lims[:-1], block_lims[1:]):
                 # Read current slice of data:
@@ -228,7 +266,7 @@ class Phonon(TreeNode):
                 "mkKab, mkKbc -> kac", self.Matrices[2], self.Matrices[0]
             )
 
-        self.rho_dot0 = self._calculate(ab_initio.rho0 * (1.0+0.0j))
+        self.rho_dot0 = self._calculate(ab_initio.rho0 * (1.0 + 0.0j))
         self.constant_params = dict(
             scale_factor=torch.tensor(scale_factor, device=rc.device),
         )
@@ -259,7 +297,14 @@ class Phonon(TreeNode):
         """Internal drho/dt calculation without detailed balance / scaling."""
         eye = self.ab_initio.eye_bands
         rho_all = self._collectT(rho)  # all k
-        if not self.matrix_form:
+        if self.form == "fermi-golden":
+            f = rho[..., range(self.ab_initio.n_bands), range(self.ab_initio.n_bands)]
+            f_all = rho_all[:, range(self.ab_initio.n_bands), range(self.ab_initio.n_bands), ...].real
+            Tf = torch.einsum("ikKab, Kb... -> i...ka", self.T, f_all)
+            Tf[1] -= self.T2eye
+            dfdt = (1 - f) * Tf[0] + f * Tf[1]
+            return torch.diag_embed(dfdt)
+        elif not self.matrix_form:
             Prho = apply_batched(self.P, rho_all)
             Prho[1] -= self.P2_eye  # convert [1] to Pbar @ (rho - eye)
             return (eye - rho) @ Prho[0] + rho @ Prho[1]  # my k only
