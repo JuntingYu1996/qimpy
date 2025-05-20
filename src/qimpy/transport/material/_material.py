@@ -101,7 +101,15 @@ class Material(TreeNode):
 
     def measure_observables(self, rho: torch.Tensor, t: float) -> torch.Tensor:
         """Return expectation value of observables, (Nx x Ny x No)."""
-        result = self.wk * torch.einsum("xya, oa -> xyo", rho, self.get_observables(t))
+        if isinstance(self.wk, float):
+            result = self.wk * torch.einsum("xya, oa -> xyo", rho, self.get_observables(t))
+        else:
+            result = torch.einsum(
+                "a, xya, oa -> xyo",
+                torch.tile(self.wk[:, None], (1, self.n_bands**2)).flatten(),
+                rho,
+                self.get_observables(t)
+            )
         if self.comm.size > 1:
             self.comm.Allreduce(MPI.IN_PLACE, BufferView(result))
         return result

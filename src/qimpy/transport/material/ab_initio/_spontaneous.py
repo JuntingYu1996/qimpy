@@ -40,7 +40,7 @@ class Spontaneous(TreeNode):
         )
         self.p = {}
         self.Gamma = {}
-        self.scale = {}
+        self.scales = {}
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext
@@ -70,12 +70,12 @@ class Spontaneous(TreeNode):
         self.p[patch_id] = ab_initio.P.swapaxes(0, 1)[:, None, None]
         self.Gamma[patch_id] = Gamma[:, None, None]
         self.eye = torch.tile(torch.eye(Nb), (1, 1, Nk, 1, 1)).to(rc.device)
-        self.scale[patch_id] = scale
+        self.scales[patch_id] = scale
 
     @stopwatch
     def rho_dot(self, rho: torch.Tensor, t: float, patch_id: int) -> torch.Tensor:
         c = 137.03599968439292
-        prefac = 2/(3 * c**3) * self.scale[patch_id]
+        prefac = 2/(3 * c**3) * self.scales[patch_id]
         I_minus_rho = self.eye - rho
         return prefac * torch.sum(
             commutator(I_minus_rho[None] @ self.Gamma[patch_id] @ rho[None], 

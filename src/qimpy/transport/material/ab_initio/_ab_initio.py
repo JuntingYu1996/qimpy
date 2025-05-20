@@ -122,8 +122,8 @@ class AbInitio(Material):
         watch = StopWatch("Dynamics.read_checkpoint")
         with Checkpoint(file) as data_file:
             attrs = data_file.attrs
-            spinorial = bool(attrs["spinorial"])
-            haveL = bool(attrs["haveL"])
+            spinorial = "spinorial" in attrs and bool(attrs["spinorial"])
+            haveL = "haveL" in attrs and bool(attrs["haveL"])
             if orbital_zeeman is None:
                 useL = haveL
             else:
@@ -132,7 +132,7 @@ class AbInitio(Material):
                     raise InvalidInputException(
                         f"L not available in {file} for orbital-zeeman"
                     )
-            if T > (Tmax := float(attrs["Tmax"])) * (1 + 1e-6):
+            if "Tmax" in attrs and T > (Tmax := float(attrs["Tmax"])) * (1 + 1e-6):
                 raise InvalidInputException(f"{T = } exceeds {Tmax = }")
             self.T = T
             wk = 1 / float(attrs["nkTot"])
@@ -147,6 +147,11 @@ class AbInitio(Material):
                 process_grid=process_grid,
             )
 
+            if "uniform" in attrs and not attrs["uniform"]:
+                self.uniform = False
+                self.wk = self.read_scalars(data_file, "wk")
+            else:
+                self.uniform = True
             self.k[:] = self.read_scalars(data_file, "k")
             self.E[:] = self.read_scalars(data_file, "E")
             self.P = self.read_vectors(data_file, "P")
