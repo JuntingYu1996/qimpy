@@ -23,7 +23,7 @@ class Phonon(TreeNode):
     P: torch.Tensor  #: P and Pbar operators stacked together
     rho_dot0: torch.Tensor  #: rho_dot(rho0) for detailed balance correction
     smearing: float  #: Width of delta function
-    form: str  #: Fermi-golden, conventional Markov or Lindblad
+    form: str  #: fermi_golden, conventional Markov or Lindblad
 
     constant_params: dict[str, torch.Tensor]  #: constant values of parameters
     scale_factor: dict[int, torch.Tensor]  #: scale factors per patch
@@ -34,6 +34,7 @@ class Phonon(TreeNode):
         *,
         ab_initio: material.ab_initio.AbInitio,
         data_file: Checkpoint,
+        read_P: bool = False,
         smearing: float = 0.001,
         scale_factor: float = 1.0,
         form: str = "conventional",
@@ -53,10 +54,11 @@ class Phonon(TreeNode):
         self.ab_initio = ab_initio
         self.data_file = data_file
         self.smearing = smearing
+        form = form.replace("-", "_")
         self.form = form
         self.uniform_smearing = uniform_smearing
-        if not form in ["fermi-golden", "conventional", "lindblad", "matrix", "conventional_fast"]:
-            raise InvalidInputException("form must be fermi-golden, conventional, lindblad or matrix")
+        if not form in ["fermi_golden", "conventional", "lindblad", "matrix", "conventional_fast"]:
+            raise InvalidInputException("form must be fermi_golden, conventional, lindblad or matrix")
         if not bool(data_file.attrs["ePhEnabled"]):
             raise InvalidInputException("No e-ph scattering available in data file")
 
@@ -67,6 +69,28 @@ class Phonon(TreeNode):
         n_bands = ab_initio.n_bands
         n_bands_sq = n_bands**2
         prefactor = np.sqrt(np.pi / 2)
+
+        if read_P:
+            if form == "fermi_golden":
+                self.T = torch.zeros((2, nk_mine, nk, n_bands, n_bands), device=rc.device)
+                batch = 100
+                nbatch = (nk_mine - 1) // batch
+                for i in range(nbatch):
+                    mysel = slice(i*batch, min((i+1)*batch, nk_mine))
+                    ksel = slice(mysel.start + ik_start, mysel.stop + ik_start)
+                self.T[:, mysel] = torch.from_numpy(
+                    np.array(data_file["Tmat"][:, ksel])
+                ).to(rc.device)
+                # self.T2eye = torch.einsum("kKab -> ka", self.T[1])
+                self.T2eye = self.T[1].sum((1,3))
+            else:
+                raise InvalidInputException("Not implemented.")
+            self.rho_dot0 = self._calculate(ab_initio.rho0 * (1.0 + 0.0j))
+            self.constant_params = dict(
+                scale_factor=torch.tensor(scale_factor, device=rc.device),
+            )
+            self.scale_factor = dict()
+            return
 
         # Collect together evecs for all k if needed:
         if (ab_initio.comm.size == 1) or (ab_initio.evecs is None):
@@ -127,7 +151,7 @@ class Phonon(TreeNode):
         else:
             cp_smearing = data_file["smearing_ph"]
 
-        if form == "fermi-golden":
+        if form == "fermi_golden":
             log.info("Using Fermi's Golden rule for phonon scattering.")
             Tshape = (2, nk_mine * nk, n_bands, n_bands)
             T = torch.zeros(Tshape, dtype=torch.double, device=rc.device)
@@ -169,7 +193,7 @@ class Phonon(TreeNode):
                 if not uniform_smearing:
                     smearing = smearing_cur[sel, None, None]
                     exp_factor = -0.5 / smearing ** 2
-                if form == "fermi-golden":
+                if form == "fermi_golden":
                     delta = torch.exp(exp_factor * (dE - omega_ph[sel, None, None])**2) / smearing
                     Gsq = (gsel * gsel.conj()).real * delta
                     T[0].index_add_(0, i_pair, wk[jk[sel]] * wm[sel] * Gsq)
@@ -212,7 +236,7 @@ class Phonon(TreeNode):
                 if not uniform_smearing:
                     smearing = smearing_cur[sel, None, None]
                     exp_factor = -0.5 / smearing ** 2
-                if form == "fermi-golden":
+                if form == "fermi_golden":
                     delta = torch.exp(exp_factor * (dE - omega_ph[sel, None, None])**2) / smearing
                     Gsq = ((gsel * gsel.conj()).real * delta).swapaxes(-1, -2)
                     T[0].index_add_(0, i_pair, wk[ik[sel]] * wp[sel] * Gsq)
@@ -240,15 +264,15 @@ class Phonon(TreeNode):
                     P2[0].index_add_(0, i_pair, wk[ik[sel]] * wp[sel] * Gsq2)
                     P2[1].index_add_(0, i_pair, wk[ik[sel]] * wm[sel] * Gsq2)
 
-        if form == "fermi-golden":
+        if form == "fermi_golden":
             self.T = T.unflatten(1, (nk_mine, nk))
             self.T2eye = torch.einsum("kKab -> ka", self.T[1])
         elif form in ["conventional", "lindblad"]:
             op_shape = (2, nk_mine * n_bands_sq, nk * n_bands_sq)
-            # self.P = P.unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
-            P_cpu = P.cpu().unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
-            del P
-            self.P = P_cpu.to(rc.device)
+            self.P = P.unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
+            # P_cpu = P.cpu().unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
+            # del P
+            # self.P = P_cpu.to(rc.device)
             self.P2_eye = apply_batched(
                 self.P, 
                 (1.0 + 0.0j) * torch.tile(ab_initio.eye_bands[None], (nk, 1, 1))[..., None]
@@ -323,7 +347,7 @@ class Phonon(TreeNode):
         """Internal drho/dt calculation without detailed balance / scaling."""
         eye = self.ab_initio.eye_bands
         rho_all = self._collectT(rho)  # all k
-        if self.form == "fermi-golden":
+        if self.form == "fermi_golden":
             f = rho[..., range(self.ab_initio.n_bands), range(self.ab_initio.n_bands)]
             f_all = rho_all[:, range(self.ab_initio.n_bands), range(self.ab_initio.n_bands), ...].real
             Tf = torch.einsum("ikKab, Kb... -> i...ka", self.T, f_all)
