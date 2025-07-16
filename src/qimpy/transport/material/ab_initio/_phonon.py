@@ -54,7 +54,7 @@ class Phonon(TreeNode):
         self.ab_initio = ab_initio
         self.data_file = data_file
         self.smearing = smearing
-        form = form.replace("-", "_")
+        form = form.replace("-", "_").lower()
         self.form = form
         self.uniform_smearing = uniform_smearing
         if not form in ["fermi_golden", "conventional", "lindblad", "matrix", "conventional_fast"]:
@@ -72,17 +72,20 @@ class Phonon(TreeNode):
 
         if read_P:
             if form == "fermi_golden":
-                self.T = torch.zeros((2, nk_mine, nk, n_bands, n_bands), device=rc.device)
+                self.T = torch.zeros(
+                    (2, nk_mine, nk, n_bands, n_bands),
+                    dtype=torch.double,
+                    device=rc.device
+                )
                 batch = 100
-                nbatch = (nk_mine - 1) // batch
+                nbatch = (nk_mine - 1) // batch + 1
                 for i in range(nbatch):
                     mysel = slice(i*batch, min((i+1)*batch, nk_mine))
                     ksel = slice(mysel.start + ik_start, mysel.stop + ik_start)
-                self.T[:, mysel] = torch.from_numpy(
-                    np.array(data_file["Tmat"][:, ksel])
-                ).to(rc.device)
-                # self.T2eye = torch.einsum("kKab -> ka", self.T[1])
-                self.T2eye = self.T[1].sum((1,3))
+                    self.T[:, mysel] = torch.from_numpy(
+                        np.array(data_file["Tmat"][:, ksel])
+                    ).to(rc.device)
+                self.T2eye = self.T[1].sum((1, 3)) # "kKab -> ka"
             else:
                 raise InvalidInputException("Not implemented.")
             self.rho_dot0 = self._calculate(ab_initio.rho0 * (1.0 + 0.0j))
@@ -266,13 +269,10 @@ class Phonon(TreeNode):
 
         if form == "fermi_golden":
             self.T = T.unflatten(1, (nk_mine, nk))
-            self.T2eye = torch.einsum("kKab -> ka", self.T[1])
+            self.T2eye = self.T[1].sum((1, 3)) # "kKab -> ka"
         elif form in ["conventional", "lindblad"]:
             op_shape = (2, nk_mine * n_bands_sq, nk * n_bands_sq)
             self.P = P.unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
-            # P_cpu = P.cpu().unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
-            # del P
-            # self.P = P_cpu.to(rc.device)
             self.P2_eye = apply_batched(
                 self.P, 
                 (1.0 + 0.0j) * torch.tile(ab_initio.eye_bands[None], (nk, 1, 1))[..., None]
