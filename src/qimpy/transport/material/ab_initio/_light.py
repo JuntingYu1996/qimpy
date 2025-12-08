@@ -43,6 +43,7 @@ class Light(TreeNode):
         smearing: float = 0.001,
         symmetric: bool = False,
         matrix_form: bool = True,
+        only_diagonal: bool = False,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         """
@@ -76,6 +77,7 @@ class Light(TreeNode):
         self.gauge = gauge
         self.symmetric = symmetric
         self.matrix_form = matrix_form
+        self.only_diagonal = only_diagonal
 
         # Get amplitude from A0 or E0:
         if (A0 is None) == (E0 is None):
@@ -202,14 +204,21 @@ class Light(TreeNode):
         t0 = self.t0[patch_id]
         sigma = self.sigma[patch_id]
         # shape of prefac must be (Nx, Ny, 1, 1, 1)
-        if sigma > 0:
+        if sigma > 0: # Gaussian
             prefac = (
                 torch.exp(-((t - t0) ** 2) / (2 * sigma**2))
                 / torch.sqrt(torch.sqrt(np.pi * sigma**2))
                 * torch.ones(rho.shape[:2] + (1, 1, 1)).to(rc.device)
             )
+        elif sigma < 0: # adiabatic switch on
+            prefac = (
+                (1 - torch.exp((t - t0) / sigma)) 
+                * torch.ones(rho.shape[:2] + (1, 1, 1)).to(rc.device)
+            )
         else:
             prefac = torch.ones(rho.shape[:2] + (1, 1, 1)).to(rc.device)
+        if self.only_diagonal:
+            prefac = prefac * self.ab_initio.eye_bands
 
         if self.coherent:
             omega = self.omega[patch_id]
