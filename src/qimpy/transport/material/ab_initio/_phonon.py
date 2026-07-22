@@ -28,6 +28,8 @@ class Phonon(TreeNode):
     omega_threshold: float  #: leave out omega < omega_threshold
     enforcing_Econs: str  #: whether to enforce energy conservation to phonon occupation
     N_sigma: float  #: the phonon occupation of those energy less than N_sigma * smearing will be changed for Econs
+    detail_balance: bool  #: imposing detail balance by replacing N+1 with N e^(dE/T)
+    dephasing: bool  #: include additional dephasing from Gamma in the data file
 
     constant_params: dict[str, torch.Tensor]  #: constant values of parameters
     scale_factor: dict[int, torch.Tensor]  #: scale factors per patch
@@ -47,6 +49,7 @@ class Phonon(TreeNode):
         enforcing_Econs: str = "no",
         N_sigma: float = 1.0, 
         detail_balance: bool = False,
+        dephasing: bool = False,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         """
@@ -65,9 +68,12 @@ class Phonon(TreeNode):
         self.form = form
         self.uniform_smearing = uniform_smearing
         if not form in [
-            "fermi_golden", "conventional", "lindblad", "conventional_fast", "conventional_sparse"
+            "fermi_golden", "conventional", "lindblad", "conventional_fast", 
+            "diagonal", "conventional_sparse"
         ]:
             raise InvalidInputException("form must be fermi_golden, conventional, lindblad")
+        if not enforcing_Econs in ["no", "low_omega", "all"]:
+            raise InvalidInputException("enforcing_Econs must be no, low_omega, all")
         if not bool(data_file.attrs["ePhEnabled"]):
             raise InvalidInputException("No e-ph scattering available in data file")
 
@@ -88,6 +94,14 @@ class Phonon(TreeNode):
         self.eye_bands = torch.eye(n_bands, device=rc.device)
         n_bands_sq = n_bands**2
         prefactor = np.sqrt(np.pi / 2)
+
+        self.dephasing = dephasing and form not in ["lindblad", "conventional", "conventional_fast", "conventional_sparse"]
+        if self.dephasing:
+            if "Gamma" not in data_file:
+                raise InvalidInputException("No Gamma available in data file")
+            # 0.5 for later HC adding
+            self.Gamma = torch.from_numpy(np.array(data_file["Gamma"][ik_start:ik_stop])).to(rc.device) * (1 - self.eye_bands) * 0.5 * scale_factor
+            log.info("Enabling additional dephasing from electron-phonon.")
 
         if read_P:
             if form == "fermi_golden":
@@ -217,7 +231,7 @@ class Phonon(TreeNode):
         def conventionalP(einsum_path, delta, g1, g2):
             return torch.einsum(
                 einsum_path, delta, g1, g2
-            ).reshape((-1, n_bands_sq, n_bands_sq))
+            )#.reshape((-1, n_bands_sq, n_bands_sq))
 
         def lindbladP(einsum_path, G1, G2):
             return torch.einsum(
@@ -262,6 +276,12 @@ class Phonon(TreeNode):
             log.info(f"Memory for P1 and P2 matrix: {bytes2memory(nbytes)}.")
             P1 = torch.zeros(P1_shape, dtype=torch.complex128, device=rc.device)
             P2 = torch.zeros(P2_shape, dtype=torch.complex128, device=rc.device)
+        elif form == "diagonal":
+            log.info("Diagonal approximation for electron-phonon scattering")
+            P_shape = (2, nk_mine * nk, n_bands_sq, n_bands)
+            nbytes = 16 * np.prod(P_shape)
+            log.info(f"Memory for P matrix: {bytes2memory(nbytes)}.")
+            P = torch.zeros(P_shape, dtype=torch.complex128, device=rc.device)
 
         for block_start, block_stop in zip(block_lims[:-1], block_lims[1:]):
             # Read current slice of data:
@@ -289,10 +309,11 @@ class Phonon(TreeNode):
                     # wm_ = wm[sel]
                     # wp_ = wm_ * torch.exp(dE / ab_initio.T)
                     omega_eff = torch.tile(omega_sel, (1, n_bands, n_bands))
-                    rep_flags = torch.minimum(dE, torch.tensor([N_sigma * smearing], device=rc.device)) >= omega_eff
+                    rep_flags = torch.minimum(torch.abs(dE), torch.tensor([N_sigma * smearing], device=rc.device)) >= omega_eff
                     omega_eff[rep_flags] = dE[rep_flags]
                     bose_occ = bose(omega_eff, ab_initio.T)
-                    omega_scale = omega_sel / omega_eff
+                    # omega_scale = omega_sel / omega_eff
+                    omega_scale = 1.0
                 else:
                     bose_occ = bose(omega_sel, ab_initio.T)
                     omega_scale = 1.0
@@ -312,8 +333,10 @@ class Phonon(TreeNode):
                 elif form == "conventional":
                     delta = torch.exp(exp_factor * (dE - omega_sel)**2) / smearing
                     Gsq = conventionalP("kac, kac, kbd -> kabcd", delta, gsel, gsel.conj())
-                    P[0].index_add_(0, i_pair, wk[jk[sel]] * wm * Gsq)  # P contribution
-                    P[1].index_add_(0, i_pair, wk[jk[sel]] * wp * Gsq)  # Pbar contribution
+                    # P[0].index_add_(0, i_pair, wk[jk[sel]] * wm * Gsq)  # P contribution
+                    # P[1].index_add_(0, i_pair, wk[jk[sel]] * wp * Gsq)  # Pbar contribution
+                    P[0].index_add_(0, i_pair, ((wk[jk[sel]] * wm)[:, :, None, :, None] * Gsq).reshape((-1, n_bands_sq, n_bands_sq)))  # P contribution
+                    P[1].index_add_(0, i_pair, ((wk[jk[sel]] * wp)[:, :, None, :, None] * Gsq).reshape((-1, n_bands_sq, n_bands_sq)))  # Pbar contribution
                 elif form == "lindblad":
                     sqrt_delta = torch.exp(
                         0.5 * exp_factor * (dE - omega_sel)**2
@@ -336,6 +359,13 @@ class Phonon(TreeNode):
                     # P1[1].index_add_(0, i_pair, (wk[jk[sel]] * wp)[:, :, :, None] * Gsq1)
                     # P2[0].index_add_(0, i_pair, (wk[jk[sel]] * wm)[:, :, None, :] * Gsq2)
                     # P2[1].index_add_(0, i_pair, (wk[jk[sel]] * wp)[:, :, None, :] * Gsq2)
+                elif form == "diagonal":
+                    delta = torch.exp(exp_factor * (dE - omega_sel)**2) / smearing
+                    Gsel = delta * gsel
+                    gconj = gsel.conj()
+                    Gsq = torch.einsum("kac, kbc -> kabc", Gsel, gconj)
+                    P[0].index_add_(0, i_pair, ((wk[jk[sel]] * wm)[:, :, None, :] * Gsq).reshape((-1, n_bands_sq, n_bands)))
+                    P[1].index_add_(0, i_pair, ((wk[jk[sel]] * wp)[:, :, None, :] * Gsq).reshape((-1, n_bands_sq, n_bands)))
                 elif form == "conventional_sparse":
                     dE_plus, dE_minus = dE + omega_sel, dE - omega_sel
                     kKxsel, s1sel, s3sel = torch.where(torch.logical_or(
@@ -368,10 +398,11 @@ class Phonon(TreeNode):
                     # wm_ = wm[sel]
                     # wp_ = wm_ * torch.exp(dE.swapaxes(-1,-2) / ab_initio.T)
                     omega_eff = torch.tile(omega_sel, (1, n_bands, n_bands))
-                    rep_flags = torch.minimum(dE.swapaxes(-1, -2), torch.tensor([N_sigma * smearing], device=rc.device)) >= omega_eff
-                    omega_eff[rep_flags] = dE.swapaxes(-1, -2)[rep_flags]
+                    rep_flags = torch.minimum(torch.abs(dE.swapaxes(-1,-2)), torch.tensor([N_sigma * smearing], device=rc.device)) >= omega_eff
+                    omega_eff[rep_flags] = dE.swapaxes(-1,-2)[rep_flags]
                     bose_occ = bose(omega_eff, ab_initio.T)
-                    omega_scale = omega_sel / omega_eff
+                    # omega_scale = omega_sel / omega_eff
+                    omega_scale = 1.0
                 else:
                     bose_occ = bose(omega_sel, ab_initio.T)
                     omega_scale = 1.0
@@ -391,8 +422,10 @@ class Phonon(TreeNode):
                 elif form == "conventional":
                     delta = torch.exp(exp_factor * (dE - omega_sel)**2) / smearing
                     Gsq = conventionalP("kca, kca, kdb -> kabcd", delta, gsel.conj(), gsel)
-                    P[0].index_add_(0, i_pair, wk[ik[sel]] * wp * Gsq)  # P contribution
-                    P[1].index_add_(0, i_pair, wk[ik[sel]] * wm * Gsq)  # Pbar contribution
+                    # P[0].index_add_(0, i_pair, wk[ik[sel]] * wp * Gsq)  # P contribution
+                    # P[1].index_add_(0, i_pair, wk[ik[sel]] * wm * Gsq)  # Pbar contribution
+                    P[0].index_add_(0, i_pair, ((wk[ik[sel]] * wp)[:, :, None, :, None] * Gsq).reshape((-1, n_bands_sq, n_bands_sq)))  # P contribution
+                    P[1].index_add_(0, i_pair, ((wk[ik[sel]] * wm)[:, :, None, :, None] * Gsq).reshape((-1, n_bands_sq, n_bands_sq)))  # Pbar contribution
                 elif form == "lindblad":
                     sqrt_delta = torch.exp(
                         0.5 * exp_factor * (dE - omega_sel)**2
@@ -414,6 +447,12 @@ class Phonon(TreeNode):
                     # P1[1].index_add_(0, i_pair, (wk[ik[sel]] * wm)[:, :, :, None] * Gsq1)
                     # P2[0].index_add_(0, i_pair, (wk[ik[sel]] * wp)[:, :, None, :] * Gsq2)
                     # P2[1].index_add_(0, i_pair, (wk[ik[sel]] * wm)[:, :, None, :] * Gsq2)
+                elif form == "diagonal":
+                    delta = torch.exp(exp_factor * (dE - omega_sel)**2) / smearing
+                    Gsel = delta * gsel.conj()
+                    Gsq = torch.einsum("kca, kcb -> kabc", Gsel, gsel)
+                    P[0].index_add_(0, i_pair, ((wk[ik[sel]] * wp)[:, :, None, :] * Gsq).reshape((-1, n_bands_sq, n_bands)))
+                    P[1].index_add_(0, i_pair, ((wk[ik[sel]] * wm)[:, :, None, :] * Gsq).reshape((-1, n_bands_sq, n_bands)))
 
         if form == "fermi_golden":
             self.T = T.unflatten(1, (nk_mine, nk))
@@ -436,6 +475,12 @@ class Phonon(TreeNode):
                 self.P1, self.P2,
                 (1.0 + 0.0j) * torch.tile(self.eye_bands[None], (nk, 1, 1))[..., None]
             )[1]
+        elif form == "diagonal":
+            op_shape = (2, nk_mine * n_bands_sq, nk * n_bands)
+            self.P = P.unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
+            self.P2_eye = self.P[1].sum(-1).reshape(nk_mine, n_bands, n_bands)
+            # self.P = P.reshape((2, nk_mine, nk, n_bands_sq, n_bands))
+            # self.P2_eye = self.P[1].sum((1, 3)).reshape(nk_mine, n_bands, n_bands)
 
         self.rho_dot0 = self._calculate(
             ab_initio.rho0[..., self.bands_sel, self.bands_sel] * (1.0 + 0.0j)
@@ -444,6 +489,7 @@ class Phonon(TreeNode):
             scale_factor=torch.tensor(scale_factor, device=rc.device),
         )
         self.scale_factor = dict()
+
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext
@@ -476,27 +522,40 @@ class Phonon(TreeNode):
     def _calculate(self, rho: torch.Tensor) -> torch.Tensor:
         """Internal drho/dt calculation without detailed balance / scaling."""
         eye = self.eye_bands
-        rho_all = self._collectT(rho)  # all k
+        if self.form in ["conventional", "lindblad", "conventional_fast", "conventional_sparse"]:
+            rho_all = self._collectT(rho)  # all k
+        else:
+            f_all = self._collect_occ(rho)
         if self.form == "fermi_golden":
             n_bands = self.n_bands
-            f = rho[..., range(n_bands), range(n_bands)]
-            f_all = rho_all[:, range(n_bands), range(n_bands), ...].real
+            f = rho[..., range(n_bands), range(n_bands)].real
+            # f_all = rho_all[:, range(n_bands), range(n_bands), ...].real
             Tf = torch.einsum("ikKab, Kb... -> i...ka", self.T, f_all)
             Tf[1] -= self.T2eye
             dfdt = (1 - f) * Tf[0] + f * Tf[1]
-            return torch.diag_embed(dfdt)
+            res = torch.diag_embed(dfdt * (1.0 + 0.0j))
         elif self.form in ["conventional", "lindblad"]:
             Prho = apply_batched(self.P, rho_all)
             Prho[1] -= self.P2_eye  # convert [1] to Pbar @ (rho - eye)
-            return (eye - rho) @ Prho[0] + rho @ Prho[1]  # my k only
+            res = (eye - rho) @ Prho[0] + rho @ Prho[1]  # my k only
         elif self.form == "conventional_fast":
             Prho = apply_batched_fast(self.P1, self.P2, rho_all)
             Prho[1] -= self.P2_eye
-            return (eye - rho) @ Prho[0] + rho @ Prho[1]
+            res = (eye - rho) @ Prho[0] + rho @ Prho[1]
+        elif self.form == "diagonal":
+            n_bands = self.n_bands
+            f = rho[..., range(n_bands), range(n_bands), None]
+            # f_all = rho_all[:, range(n_bands), range(n_bands), ...].flatten(0,1)
+            Pf = apply_batched_diagonal(self.P, f_all)
+            Pf[1] -= self.P2_eye
+            res = (1-f) * Pf[0] + f * Pf[1]
         elif self.form == "conventional_sparse":
             Prho = self.apply_batched_sparse(rho_all)
             Prho[1] -= self.P2_eye
-            return (eye - rho) @ Prho[0] + rho @ Prho[1]
+            res = (eye - rho) @ Prho[0] + rho @ Prho[1]
+        if self.dephasing:
+            res -= self.Gamma * rho
+        return res
 
     def _collectT(self, rho: torch.Tensor) -> torch.Tensor:
         """Collect rho from all MPI processes and transpose batch dimension.
@@ -519,6 +578,29 @@ class Phonon(TreeNode):
             (BufferView(recvbuf), np.diff(recv_prev), recv_prev[:-1], mpi_type),
         )
         return recvbuf.reshape((nk, n_bands, n_bands) + batch_shape)
+
+    def _collect_occ(self, rho: torch.Tensor) -> torch.Tensor:
+        """Collect occupation from all MPI processes and transpose batch dimension.
+        Batch dimension is put at end for efficient matrix multiplication."""
+        ab_initio = self.ab_initio
+        if ab_initio.comm.size == 1:
+            return torch.einsum("...kaa -> ka...", rho).real
+        nk = ab_initio.k_division.n_tot
+        n_bands = self.n_bands
+        batch_shape = rho.shape[:-3]
+        n_batch = int(np.prod(batch_shape))
+        f = rho[..., range(n_bands), range(n_bands)].real
+        sendbuf = f.reshape(n_batch, -1).T.contiguous()
+        recvbuf = torch.zeros(
+            (n_batch, nk * n_bands), dtype=f.dtype, device=rc.device
+        )
+        mpi_type = rc.mpi_type[f.dtype]
+        recv_prev = ab_initio.k_division.n_prev * n_bands * n_batch
+        ab_initio.comm.Allgatherv(
+            (BufferView(sendbuf), np.prod(f.shape), 0, mpi_type),
+            (BufferView(recvbuf), np.diff(recv_prev), recv_prev[:-1], mpi_type),
+        )
+        return recvbuf.reshape((nk, n_bands) + batch_shape)
 
     def apply_batched_sparse(self, rho: torch.Tensor) -> torch.Tensor:
         # P: (2, Npair, s2, s4), rho: (k,s3,s4,x,y)
@@ -552,9 +634,28 @@ def apply_batched_fast(P1: torch.Tensor, P2: torch.Tensor, rho: torch.Tensor) ->
     ).unflatten(-1, (-1, nbands)) # diagonal
     return result
 
+def apply_batched_diagonal(P: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+    result = torch.einsum(
+        "ikK, K... -> i...k", P, f.flatten(0,1) * (1.0 + 0.0j)
+    )  # (2, n1, n2, k*a*b)
+    # result = torch.einsum(
+    #     "ik... -> i...k", 
+    #     torch.tensordot(P, f.flatten(0,1) * (1.0 + 0.0j), dims=1)
+    # )
+    n_bands = f.shape[1]
+    return result.unflatten(-1, (-1, n_bands, n_bands))
+
+def apply_batched_diagonal_new(P: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+    result = torch.einsum(
+        "ikKAb, Kb... -> i...kA", P, f * (1.0 + 0.0j)
+    )  # (2, n1, n2, k*a*b)
+    # result = torch.einsum("ikA... -> i...kA", torch.tensordot(P, f * (1.0 + 0.0j), dims=([2, 4], [0, 1])))
+    n_bands = f.shape[1]
+    return result.unflatten(-1, (n_bands, n_bands))
+
 def bytes2memory(nbytes):
     if nbytes >= 1024**3:
-        return f"{nbytes / 1024**3 :.2f} GB"
+        return f"{nbytes / 1024**3:.2f} GB"
     elif nbytes >= 1024**2:
         return f"{nbytes / 1024**2:.2f} MB"
     elif nbytes >= 1024:
